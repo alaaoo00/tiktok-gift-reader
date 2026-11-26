@@ -23,6 +23,7 @@ state = {
     "connected": False,
     "message": "جاري بدء التشغيل...",
     "target_gift": "",
+    "speech_template": "شكراً {sender} على {gift}",  # الصيغة الافتراضية
 }
 
 try:
@@ -172,6 +173,7 @@ def api_state():
             "connected": state["connected"],
             "message": state["message"],
             "target_gift": state["target_gift"],
+            "speech_template": state["speech_template"],
             "latest_id": latest,
         })
 
@@ -188,9 +190,15 @@ def api_events():
 def api_config():
     data = request.get_json(silent=True) or {}
     with lock:
-        state["target_gift"] = str(data.get("target_gift", ""))[:60]
-        target = state["target_gift"]
-    return jsonify({"ok": True, "target_gift": target})
+        if "target_gift" in data:
+            state["target_gift"] = str(data["target_gift"])[:60]
+        if "speech_template" in data:
+            state["speech_template"] = str(data["speech_template"])[:200]
+    return jsonify({
+        "ok": True,
+        "target_gift": state["target_gift"],
+        "speech_template": state["speech_template"],
+    })
 
 
 HTML_PAGE = """
@@ -206,12 +214,15 @@ HTML_PAGE = """
   .card{background:#1e1e1e;border-radius:12px;padding:14px;margin-bottom:12px}
   button{background:#ff0050;color:#fff;border:0;border-radius:10px;padding:12px 16px;font-size:16px;width:100%;cursor:pointer}
   button.sec{background:#333;margin-top:8px}
-  input,select{width:100%;padding:12px;border-radius:10px;border:1px solid #444;background:#000;color:#fff;font-size:16px;box-sizing:border-box;margin-top:6px}
+  input,select,textarea{width:100%;padding:12px;border-radius:10px;border:1px solid #444;background:#000;color:#fff;font-size:16px;box-sizing:border-box;margin-top:6px}
+  textarea{min-height:70px;resize:vertical;font-family:inherit}
   .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;margin-left:6px}
   .on{background:#0f0}.off{background:#f33}
   .row{font-size:15px;padding:8px;border-bottom:1px solid #2a2a2a}
   small{color:#aaa;display:block;margin-top:4px}
   label{font-size:14px;color:#ccc}
+  .preset{display:inline-block;background:#2a2a2a;color:#fff;border:1px solid #444;border-radius:8px;padding:6px 10px;margin:3px;font-size:13px;cursor:pointer}
+  .preset:hover{background:#ff0050}
 </style>
 </head>
 <body>
@@ -245,6 +256,27 @@ HTML_PAGE = """
 </div>
 
 <div class="card">
+  <b>💬 صيغة الكلام المنطوق</b>
+  <small>استخدم: <b>{sender}</b> = الاسم، <b>{gift}</b> = الهدية، <b>{count}</b> = العدد</small>
+  <textarea id="template" placeholder="شكراً {sender} على {gift}"></textarea>
+  
+  <div style="margin-top:10px">
+    <small>صيغ جاهزة (اضغط للاختيار):</small>
+    <div style="margin-top:6px">
+      <span class="preset" data-t="شكراً {sender} على {gift}">شكر بسيط</span>
+      <span class="preset" data-t="أهلاً وسهلاً {sender}، شكراً على الهدية">ترحيب</span>
+      <span class="preset" data-t="واو! {sender} أرسل {count} {gift}! شكراً جزيلاً">حماسي</span>
+      <span class="preset" data-t="نشكر {sender} على هدية {gift}">رسمي</span>
+      <span class="preset" data-t="Thanks {sender} for the {gift}">إنجليزي</span>
+      <span class="preset" data-t="{sender} ❤️ {gift}">قصير</span>
+    </div>
+  </div>
+  
+  <button class="sec" id="saveTemplate" style="margin-top:10px">حفظ الصيغة</button>
+  <small id="templateSaved"></small>
+</div>
+
+<div class="card">
   <b>📋 آخر الهدايا</b>
   <div id="log"></div>
 </div>
@@ -271,9 +303,16 @@ function loadVoices(){
 loadVoices();
 if(typeof speechSynthesis !== 'undefined') speechSynthesis.onvoiceschanged = loadVoices;
 
+function buildText(template, sender, gift, count){
+  return template
+    .replace(/{sender}/g, sender)
+    .replace(/{gift}/g, gift)
+    .replace(/{count}/g, count);
+}
+
 function speak(text){
   if(!audioReady) return;
-  speechSynthesis.cancel(); // إيقاف أي كلام سابق
+  speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
   u.lang = 'ar-SA';
   const sel = document.getElementById('voiceSelect');
@@ -292,14 +331,32 @@ document.getElementById('unlock').onclick = async () => {
   try{ if('wakeLock' in navigator) await navigator.wakeLock.request('screen'); }catch(e){}
 };
 
-document.getElementById('test').onclick = () => speak("شكراً لك على إرسال وردة");
+document.getElementById('test').onclick = () => {
+  const tpl = document.getElementById('template').value || "شكراً {sender} على {gift}";
+  const sample = buildText(tpl, "أحمد", "وردة", 1);
+  speak(sample);
+};
 
 document.getElementById('save').onclick = async () => {
   const val = document.getElementById('target').value;
-  const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target_gift:val})});
+  const tpl = document.getElementById('template').value;
+  const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target_gift:val, speech_template:tpl})});
   const j = await r.json();
   document.getElementById('saved').textContent = j.target_gift ? ("سيقرأ فقط هدية: " + j.target_gift) : "سيقرأ كل الهدايا";
 };
+
+document.getElementById('saveTemplate').onclick = async () => {
+  const tpl = document.getElementById('template').value;
+  const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({speech_template:tpl})});
+  const j = await r.json();
+  document.getElementById('templateSaved').textContent = "✅ تم حفظ الصيغة: " + j.speech_template;
+};
+
+document.querySelectorAll('.preset').forEach(el => {
+  el.onclick = () => {
+    document.getElementById('template').value = el.dataset.t;
+  };
+});
 
 async function refreshState(){
   try{
@@ -310,6 +367,8 @@ async function refreshState(){
     if(lastId === null) lastId = s.latest_id;
     if(document.getElementById('target').value === "" && s.target_gift)
       document.getElementById('target').value = s.target_gift;
+    if(document.getElementById('template').value === "" && s.speech_template)
+      document.getElementById('template').value = s.speech_template;
   }catch(e){}
 }
 
@@ -317,10 +376,10 @@ async function poll(){
   if(lastId === null){ await refreshState(); return; }
   try{
     const items = await (await fetch('/api/events?after=' + lastId)).json();
+    const tpl = document.getElementById('template').value || "شكراً {sender} على {gift}";
     for(const g of items){
       lastId = g.id;
-      const txt = g.count > 1 ? ("شكراً " + g.sender + " على " + g.count + " " + g.gift)
-                              : ("شكراً " + g.sender + " على " + g.gift);
+      const txt = buildText(tpl, g.sender, g.gift, g.count);
       speak(txt);
       const d = document.createElement('div');
       d.className = 'row';

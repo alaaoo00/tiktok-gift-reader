@@ -8,8 +8,8 @@ from collections import deque
 from flask import Flask, jsonify, request, render_template_string
 
 # ================= الإعدادات =================
-UNIQUE_ID = os.environ.get("TIKTOK_USER", "nova_scrolls")   # اسمك على تيك توك
-RETRY_SECONDS = 15                                          # إعادة المحاولة إذا ما كنت لايف
+UNIQUE_ID = os.environ.get("TIKTOK_USER", "nova_scrolls")
+RETRY_SECONDS = 15
 # =============================================
 
 app = Flask(__name__)
@@ -22,10 +22,9 @@ state = {
     "username": UNIQUE_ID,
     "connected": False,
     "message": "جاري بدء التشغيل...",
-    "target_gift": "",   # فاضي = كل الهدايا / مكتوب = هدية محددة فقط
+    "target_gift": "",
 }
 
-# ---------- استيراد المكتبة (تدعم النسخة الجديدة والقديمة) ----------
 try:
     from TikTokLive import TikTokLiveClient
     from TikTokLive.events import GiftEvent, ConnectEvent, DisconnectEvent
@@ -37,7 +36,6 @@ except ImportError:
 
 
 def dig(obj, *paths, default=None):
-    """يقرأ أول مسار متاح من الكائن (لأن أسماء الحقول تختلف بين إصدارات المكتبة)"""
     for path in paths:
         cur = obj
         for part in path.split("."):
@@ -53,7 +51,7 @@ def add_gift(sender, gift_name, count):
     with lock:
         target = state["target_gift"].strip().lower()
         if target and target not in gift_name.strip().lower():
-            print(f"⏭️ تجاهل (هدية غير مطابقة): {sender} - {gift_name}")
+            print(f"⏭️ تجاهل: {sender} - {gift_name}")
             return
         item = {
             "id": next(counter),
@@ -74,7 +72,6 @@ async def handle_gift(event):
     streakable = bool(dig(event, "gift.streakable", "gift.info.streakable", default=False))
     repeat_end = dig(event, "repeat_end", "gift.repeat_end", default=True)
 
-    # الهدايا المتكررة (كومبو): ننتظر انتهاء الضربات حتى لا يتكرر الصوت مزعج
     if streakable and repeat_end is False:
         return
 
@@ -143,7 +140,9 @@ async def tiktok_loop():
             msg = str(e)
             with lock:
                 state["connected"] = False
-                if "LIVE_NOT_FOUND" in msg or "not live" in msg.lower() or "user_not_found" in msg.lower():
+                if ("LIVE_NOT_FOUND" in msg or "not live" in msg.lower() or
+                    "user_not_found" in msg.lower() or "UserOffline" in msg or
+                    "Offline" in msg):
                     state["message"] = "أنت غير لايف الآن — شغّل البث وسيتصل تلقائياً."
                 else:
                     state["message"] = f"خطأ: {msg[:120]}"
@@ -205,13 +204,14 @@ HTML_PAGE = """
   body{font-family:system-ui,Arial;margin:0;padding:16px;background:#111;color:#fff}
   h1{font-size:20px;color:#ff0050;margin:0 0 12px}
   .card{background:#1e1e1e;border-radius:12px;padding:14px;margin-bottom:12px}
-  button{background:#ff0050;color:#fff;border:0;border-radius:10px;padding:12px 16px;font-size:16px;width:100%}
+  button{background:#ff0050;color:#fff;border:0;border-radius:10px;padding:12px 16px;font-size:16px;width:100%;cursor:pointer}
   button.sec{background:#333;margin-top:8px}
-  input{width:100%;padding:12px;border-radius:10px;border:1px solid #444;background:#000;color:#fff;font-size:16px;box-sizing:border-box}
+  input,select{width:100%;padding:12px;border-radius:10px;border:1px solid #444;background:#000;color:#fff;font-size:16px;box-sizing:border-box;margin-top:6px}
   .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;margin-left:6px}
   .on{background:#0f0}.off{background:#f33}
   .row{font-size:15px;padding:8px;border-bottom:1px solid #2a2a2a}
-  small{color:#aaa}
+  small{color:#aaa;display:block;margin-top:4px}
+  label{font-size:14px;color:#ccc}
 </style>
 </head>
 <body>
@@ -225,14 +225,27 @@ HTML_PAGE = """
 </div>
 
 <div class="card">
-  <small>اسم الهدية المختارة (اتركها فاضية لكل الهدايا)</small>
-  <input id="target" placeholder="مثال: Rose أو وردة">
+  <b>🎙️ إعدادات الصوت</b>
+  <label>اختر الصوت</label>
+  <select id="voiceSelect"></select>
+  
+  <label style="margin-top:12px">السرعة: <span id="rateVal">0.95</span></label>
+  <input type="range" id="rateSlider" min="0.5" max="2" step="0.05" value="0.95" oninput="document.getElementById('rateVal').textContent=this.value">
+  
+  <label style="margin-top:12px">الحدة (pitch): <span id="pitchVal">1.0</span></label>
+  <input type="range" id="pitchSlider" min="0.5" max="2" step="0.1" value="1.0" oninput="document.getElementById('pitchVal').textContent=this.value">
+</div>
+
+<div class="card">
+  <b>🎯 الهدية المختارة</b>
+  <small>اتركها فاضية لقراءة كل الهدايا، أو اكتب اسم هدية محددة</small>
+  <input id="target" placeholder="مثال: Rose أو Lion">
   <button class="sec" id="save">حفظ الهدية المختارة</button>
   <small id="saved"></small>
 </div>
 
 <div class="card">
-  <b>آخر الهدايا</b>
+  <b>📋 آخر الهدايا</b>
   <div id="log"></div>
 </div>
 
@@ -240,20 +253,35 @@ HTML_PAGE = """
 let audioReady = false;
 let lastId = null;
 let arVoice = null;
+let voices = [];
 
-function pickVoice(){
-  const vs = speechSynthesis.getVoices() || [];
-  arVoice = vs.find(v => (v.lang||'').toLowerCase().startsWith('ar')) || null;
+function loadVoices(){
+  voices = speechSynthesis.getVoices() || [];
+  const select = document.getElementById('voiceSelect');
+  if(!select) return;
+  select.innerHTML = '<option value="">صوت تلقائي (عربي إن أمكن)</option>';
+  voices.forEach((v, i) => {
+    const opt = document.createElement('option');
+    opt.value = i;
+    opt.textContent = `${v.name} (${v.lang})`;
+    if((v.lang||'').toLowerCase().startsWith('ar')) opt.selected = true;
+    select.appendChild(opt);
+  });
 }
-pickVoice();
-if (typeof speechSynthesis !== 'undefined') speechSynthesis.onvoiceschanged = pickVoice;
+loadVoices();
+if(typeof speechSynthesis !== 'undefined') speechSynthesis.onvoiceschanged = loadVoices;
 
 function speak(text){
   if(!audioReady) return;
+  speechSynthesis.cancel(); // إيقاف أي كلام سابق
   const u = new SpeechSynthesisUtterance(text);
   u.lang = 'ar-SA';
-  if(arVoice) u.voice = arVoice;
-  u.rate = 0.95; u.volume = 1;
+  const sel = document.getElementById('voiceSelect');
+  if(sel && sel.value !== '') u.voice = voices[parseInt(sel.value)];
+  else if(arVoice) u.voice = arVoice;
+  u.rate = parseFloat(document.getElementById('rateSlider').value) || 0.95;
+  u.pitch = parseFloat(document.getElementById('pitchSlider').value) || 1.0;
+  u.volume = 1;
   speechSynthesis.speak(u);
 }
 
@@ -279,7 +307,7 @@ async function refreshState(){
     document.getElementById('status').textContent = s.message;
     document.getElementById('dot').className = 'dot ' + (s.connected ? 'on':'off');
     document.getElementById('user').textContent = " @" + s.username;
-    if(lastId === null) lastId = s.latest_id;   // لا ينطق الهدايا القديمة
+    if(lastId === null) lastId = s.latest_id;
     if(document.getElementById('target').value === "" && s.target_gift)
       document.getElementById('target').value = s.target_gift;
   }catch(e){}

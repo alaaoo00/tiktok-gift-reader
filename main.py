@@ -8,7 +8,7 @@ from collections import deque
 from flask import Flask, jsonify, request, render_template_string
 
 # ================= الإعدادات =================
-UNIQUE_ID = os.environ.get("TIKTOK_USER", "nova_scrolls")
+DEFAULT_USER = os.environ.get("TIKTOK_USER", "nova_scrolls")
 RETRY_SECONDS = 15
 # =============================================
 
@@ -18,12 +18,15 @@ gift_events = deque(maxlen=300)
 counter = itertools.count(1)
 lock = threading.Lock()
 
+reconnect_event = threading.Event()
+
 state = {
-    "username": UNIQUE_ID,
+    "username": DEFAULT_USER,
     "connected": False,
     "message": "جاري بدء التشغيل...",
     "target_gift": "",
-    "speech_template": "شكراً {sender} على {gift}",  # الصيغة الافتراضية
+    "speech_template": "شكراً {sender} على {gift}",
+    "is_active": True,  # جديد: حالة التشغيل/الإيقاف
 }
 
 try:
@@ -50,6 +53,8 @@ def dig(obj, *paths, default=None):
 
 def add_gift(sender, gift_name, count):
     with lock:
+        if not state["is_active"]:
+            return  # متوقف - لا نضيف هدايا
         target = state["target_gift"].strip().lower()
         if target and target not in gift_name.strip().lower():
             print(f"⏭️ تجاهل: {sender} - {gift_name}")
@@ -87,7 +92,7 @@ async def handle_gift(event):
 async def handle_connect(event):
     with lock:
         state["connected"] = True
-        state["message"] = f"متصل ببث @{UNIQUE_ID} ✅"
+        state["message"] = f"متصل ببث @{state['username']} ✅"
     print(state["message"])
 
 
@@ -123,9 +128,9 @@ async def tiktok_loop():
     while True:
         with lock:
             state["connected"] = False
-            state["message"] = f"جاري الاتصال بـ @{UNIQUE_ID} ..."
+            state["message"] = f"جاري الاتصال بـ @{state['username']} ..."
         try:
-            client = TikTokLiveClient(unique_id=UNIQUE_ID)
+            client = TikTokLiveClient(unique_id=state["username"])
             register(client, GiftEvent, "gift", handle_gift)
             register(client, ConnectEvent, "connect", handle_connect)
             register(client, DisconnectEvent, "disconnect", handle_disconnect)
@@ -144,14 +149,16 @@ async def tiktok_loop():
                 if ("LIVE_NOT_FOUND" in msg or "not live" in msg.lower() or
                     "user_not_found" in msg.lower() or "UserOffline" in msg or
                     "Offline" in msg):
-                    state["message"] = "أنت غير لايف الآن — شغّل البث وسيتصل تلقائياً."
+                    state["message"] = f"@{state['username']} غير لايف الآن — شغّل البث وسيتصل تلقائياً."
                 else:
                     state["message"] = f"خطأ: {msg[:120]}"
             print("❌", msg)
 
         with lock:
             state["connected"] = False
-        await asyncio.sleep(RETRY_SECONDS)
+        
+        reconnect_event.wait(timeout=RETRY_SECONDS)
+        reconnect_event.clear()
 
 
 def run_tiktok_thread():
@@ -174,6 +181,7 @@ def api_state():
             "message": state["message"],
             "target_gift": state["target_gift"],
             "speech_template": state["speech_template"],
+            "is_active": state["is_active"],
             "latest_id": latest,
         })
 
@@ -201,6 +209,41 @@ def api_config():
     })
 
 
+@app.route("/api/change_user", methods=["POST"])
+def api_change_user():
+    data = request.get_json(silent=True) or {}
+    new_user = str(data.get("username", "")).strip().lstrip("@")[:50]
+    
+    if not new_user:
+        return jsonify({"ok": False, "message": "اسم المستخدم فارغ"}), 400
+    
+    with lock:
+        state["username"] = new_user
+        state["connected"] = False
+        state["message"] = f"جاري الاتصال بـ @{new_user} ..."
+    
+    reconnect_event.set()
+    
+    print(f"🔄 تغيير الحساب إلى @{new_user}")
+    return jsonify({"ok": True, "username": new_user, "message": f"جاري الاتصال بـ @{new_user}"})
+
+
+@app.route("/api/toggle", methods=["POST"])
+def api_toggle():
+    """تبديل حالة التشغيل/الإيقاف"""
+    with lock:
+        state["is_active"] = not state["is_active"]
+        is_active = state["is_active"]
+    
+    if is_active:
+        msg = "✅ تم التشغيل - جاري قراءة الهدايا"
+    else:
+        msg = "⏸️ تم الإيقاف - لن يتم قراءة الهدايا"
+    
+    print(msg)
+    return jsonify({"ok": True, "is_active": is_active, "message": msg})
+
+
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -214,6 +257,8 @@ HTML_PAGE = """
   .card{background:#1e1e1e;border-radius:12px;padding:14px;margin-bottom:12px}
   button{background:#ff0050;color:#fff;border:0;border-radius:10px;padding:12px 16px;font-size:16px;width:100%;cursor:pointer}
   button.sec{background:#333;margin-top:8px}
+  button.stop{background:#f44336;margin-top:8px}
+  button.start{background:#4CAF50;margin-top:8px}
   input,select,textarea{width:100%;padding:12px;border-radius:10px;border:1px solid #444;background:#000;color:#fff;font-size:16px;box-sizing:border-box;margin-top:6px}
   textarea{min-height:70px;resize:vertical;font-family:inherit}
   .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;margin-left:6px}
@@ -223,6 +268,10 @@ HTML_PAGE = """
   label{font-size:14px;color:#ccc}
   .preset{display:inline-block;background:#2a2a2a;color:#fff;border:1px solid #444;border-radius:8px;padding:6px 10px;margin:3px;font-size:13px;cursor:pointer}
   .preset:hover{background:#ff0050}
+  .user-display{font-size:18px;color:#00f2ea;font-weight:bold;margin-top:8px}
+  .status-badge{display:inline-block;padding:4px 10px;border-radius:6px;font-size:13px;margin-right:6px}
+  .badge-active{background:#4CAF50;color:#fff}
+  .badge-stopped{background:#f44336;color:#fff}
 </style>
 </head>
 <body>
@@ -231,8 +280,25 @@ HTML_PAGE = """
 <div class="card">
   <button id="unlock">🔊 تفعيل الصوت (اضغط مرة واحدة)</button>
   <button class="sec" id="test">تجربة الصوت</button>
-  <div style="margin-top:10px"><span class="dot" id="dot"></span><span id="status">...</span></div>
-  <small id="user"></small>
+  <div style="margin-top:10px">
+    <span class="dot" id="dot"></span><span id="status">...</span>
+    <span class="status-badge" id="activeBadge">● شغّال</span>
+  </div>
+  <div class="user-display" id="userDisplay">@nova_scrolls</div>
+</div>
+
+<div class="card">
+  <b>⏯️ التحكم بالتشغيل</b>
+  <button class="stop" id="toggleBtn">⏸️ إيقاف قراءة الهدايا</button>
+  <small id="toggleMsg">التطبيق يعمل ويقرأ الهدايا</small>
+</div>
+
+<div class="card">
+  <b>👤 تغيير حساب تيك توك</b>
+  <small>اكتب اسم المستخدم الجديد (بدون @) واضغط حفظ</small>
+  <input id="newUser" placeholder="مثال: nova_scrolls">
+  <button class="sec" id="changeUser">حفظ الحساب والاتصال</button>
+  <small id="userChanged"></small>
 </div>
 
 <div class="card">
@@ -352,6 +418,59 @@ document.getElementById('saveTemplate').onclick = async () => {
   document.getElementById('templateSaved').textContent = "✅ تم حفظ الصيغة: " + j.speech_template;
 };
 
+document.getElementById('changeUser').onclick = async () => {
+  const newUser = document.getElementById('newUser').value.trim().replace(/^@/, '');
+  if(!newUser){
+    document.getElementById('userChanged').textContent = "⚠️ اكتب اسم المستخدم أولاً";
+    return;
+  }
+  document.getElementById('userChanged').textContent = "⏳ جاري تغيير الحساب...";
+  try{
+    const r = await fetch('/api/change_user',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:newUser})});
+    const j = await r.json();
+    if(j.ok){
+      document.getElementById('userChanged').textContent = "✅ تم تغيير الحساب إلى @" + j.username;
+      document.getElementById('newUser').value = '';
+      document.getElementById('userDisplay').textContent = '@' + j.username;
+    } else {
+      document.getElementById('userChanged').textContent = "❌ " + j.message;
+    }
+  }catch(e){
+    document.getElementById('userChanged').textContent = "❌ خطأ في الاتصال";
+  }
+};
+
+document.getElementById('toggleBtn').onclick = async () => {
+  try{
+    const r = await fetch('/api/toggle',{method:'POST'});
+    const j = await r.json();
+    if(j.ok){
+      updateToggleUI(j.is_active, j.message);
+    }
+  }catch(e){
+    document.getElementById('toggleMsg').textContent = "❌ خطأ في الاتصال";
+  }
+};
+
+function updateToggleUI(isActive, msg){
+  const btn = document.getElementById('toggleBtn');
+  const badge = document.getElementById('activeBadge');
+  const statusMsg = document.getElementById('toggleMsg');
+  
+  if(isActive){
+    btn.textContent = "⏸️ إيقاف قراءة الهدايا";
+    btn.className = "stop";
+    badge.textContent = "● شغّال";
+    badge.className = "status-badge badge-active";
+  } else {
+    btn.textContent = "▶️ تشغيل قراءة الهدايا";
+    btn.className = "start";
+    badge.textContent = "● متوقف";
+    badge.className = "status-badge badge-stopped";
+  }
+  statusMsg.textContent = msg;
+}
+
 document.querySelectorAll('.preset').forEach(el => {
   el.onclick = () => {
     document.getElementById('template').value = el.dataset.t;
@@ -363,12 +482,13 @@ async function refreshState(){
     const s = await (await fetch('/api/state')).json();
     document.getElementById('status').textContent = s.message;
     document.getElementById('dot').className = 'dot ' + (s.connected ? 'on':'off');
-    document.getElementById('user').textContent = " @" + s.username;
+    document.getElementById('userDisplay').textContent = '@' + s.username;
     if(lastId === null) lastId = s.latest_id;
     if(document.getElementById('target').value === "" && s.target_gift)
       document.getElementById('target').value = s.target_gift;
     if(document.getElementById('template').value === "" && s.speech_template)
       document.getElementById('template').value = s.speech_template;
+    updateToggleUI(s.is_active, s.is_active ? "التطبيق يعمل ويقرأ الهدايا" : "التطبيق متوقف - لن يقرأ الهدايا");
   }catch(e){}
 }
 
